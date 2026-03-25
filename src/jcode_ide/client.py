@@ -78,6 +78,23 @@ class SelectionInfo:
 
 
 class IDEClient:
+    """IDE MCP 客户端——通过 HTTP JSON-RPC 调用 IDE 扩展的 MCP 工具。
+
+    生命周期
+    --------
+    支持两种使用模式：
+    - **上下文管理器模式**（推荐）：``async with IDEClient(info) as client:``
+      复用同一个 httpx.AsyncClient 连接池。
+    - **即用即弃模式**：不使用 async with，每次 _call_tool 创建临时 client
+      并在调用后关闭。适用于偶发调用。
+
+    并发约束
+    --------
+    ``_diff_lock`` 保证同一时刻只有一个 open_diff 操作在进行。这是必要的，
+    因为 VS Code 只能同时显示一个 diff 视图——并发打开会导致前一个被覆盖。
+    其他只读操作（get_open_files、get_selection 等）不受此锁限制。
+    """
+
     def __init__(self, server_info: ServerInfo):
         self.server_info = server_info
         self._diff_lock = asyncio.Lock()

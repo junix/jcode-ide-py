@@ -29,6 +29,26 @@ class ServerInfo:
 
 
 class IDEServerDiscovery:
+    """IDE 服务发现——通过文件系统端口文件定位运行中的 IDE 扩展。
+
+    发现策略（按优先级）
+    -------------------
+    1. 环境变量 ``LETTA_IDE_SERVER_PORT``（精确端口，跳过扫描）
+    2. 端口文件扫描 + workspace_path 精确匹配（多窗口场景）
+    3. 端口文件扫描 + 第一个可用服务器（降级）
+
+    端口文件由 IDE 扩展在启动时写入，格式为
+    ``letta-ide-server-<nonce>-<port>.json``。发现过程会：
+    - 检查进程是否存活（os.kill(pid, 0)）过滤僵尸文件
+    - ping 验证 nonce 匹配（防止端口被其他进程复用）
+    - 按 created_at 降序排列（优先选择最新的服务器）
+
+    陷阱
+    ----
+    端口文件在 IDE 崩溃时不会自动清理。``cleanup_stale_port_files``
+    可手动清理进程已退出的文件，但正常流程中依赖 pid 存活检查过滤。
+    """
+
     PORT_FILE_DIR: ClassVar[Path] = Path.home() / ".tmp" / "letta" / "ide"
 
     @classmethod
