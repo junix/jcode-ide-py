@@ -1,0 +1,774 @@
+# 索引（Index）
+
+::: about
+- 状态：Draft
+- 负责人：<name @handle>
+- 最近更新：<YYYY-MM-DD>
+- 影响范围：`llama-index-core/llama_index/core/indices/*`
+- 链接：相关源码、ADR、示例
+:::
+
+---
+
+## TL;DR（2–5 点）
+
+- 设计意图：将 Node 组织为适合检索与上层查询的结构（向量、顺序、树、关键词、文档摘要、属性图）。
+- 关键数据结构：`IndexStruct` 族（`IndexDict`、`IndexList`、`IndexGraph`、`KeywordTable`、`IndexDocumentSummary`、`IndexLPG`）。
+- 核心算法：批量嵌入入库、LLM/RAKE 关键词抽取、树形自底向上聚合、文档级摘要合成、三元组/属性图抽取与去重。
+- 接口入口：`BaseIndex` 与各具体 Index（`VectorStoreIndex`、`SummaryIndex`、`TreeIndex`、`KeywordTableIndex`、`DocumentSummaryIndex`、`PropertyGraphIndex`）。
+- 关键权衡：构建时开销 vs 查询时效率、是否重复存储文本、是否依赖 LLM、可更新性与后端能力差异。
+
+---
+
+## 设计意图与范围
+
+- 目标：提供一组可组合的索引实现，最小化上层检索/查询引擎的复杂度，并允许在不同底层后端（向量库/图存储）间切换。
+- 非目标：运维、可观测性、安全/权限、性能基准与发布流程。
+- 约束：
+  - 统一通过 `BaseIndex` 生命周期管理存储（`StorageContext`）与 `IndexStruct`；
+  - 与 Node/Document/Transformations（摄取流水线）保持接口稳定；
+  - `as_retriever()` 与查询引擎解耦，保持可替换性。
+
+---
+
+## 架构视角（Architecture）
+
+用一段话：各 Index 共享 `BaseIndex` 的构建/插入/删除框架，通过 `StorageContext` 协调 `docstore`、`index_store`、`vector_store`、`graph_store`。`as_retriever()` 输出检索器，供查询引擎装配。
+
+```mermaid
+flowchart TD
+  U[用户代码] --> API[Index 对外 API]
+  API --> Base[BaseIndex 生命周期]
+  Base --> SC[StorageContext]
+  SC --> DS[DocStore]
+  SC --> VS[VectorStore]
+  SC --> GS[Graph/PropertyGraph]
+  Base --> IS[IndexStruct]
+  API --> RET[as_retriever]
+  RET --> QE[QueryEngine]
+```
+
+关键决策（聚焦设计与算法）
+
+- `IndexStruct` 为“最小可维护”结构，复杂逻辑留给检索器与上层引擎；
+- 通过 `StorageContext` 抽象底层存储，使索引实现专注于组织与一致性；
+- 构建期间尽可能批处理（embedding、抽取）以降低模型/IO 次数；
+- 对 LLM 依赖的索引（关键词、文档摘要、树）提供可替代路径或可配置组件。
+
+---
+
+## 数据模型（Data Model）
+
+- 抽象
+  - `BaseIndex[index_struct: IS]`：统一构建（`build_index_from_nodes`）、插入（`_insert`）、删除（`_delete_node`）、转换（`from_documents`）。
+  - `IndexStruct` 族：
+    - `IndexDict`：记录向量库条目 ID 与 Node 的对应（当后端不存文本时）；
+    - `IndexList`：顺序存放 Node ID；
+    - `IndexGraph`：树结构节点与父子关系；
+    - `KeywordTable`：关键词到 Node ID 的多值映射；
+    - `IndexDocumentSummary`：doc_id → summary_id → node_ids；
+    - `IndexLPG`：属性图索引（结构占位，核心状态在图存储）。
+- 不变量与约束
+    - 任意被索引的 Node 应存入 `docstore`（除非后端已存文本且实现刻意去重）；
+    - `ref_doc_id` 驱动的删除/刷新需保持 `index_store` 与 `docstore` 一致；
+    - `VectorStoreIndex` 在 `stores_text=True` 时只在结构上挂接非文本 Node（如 Image/IndexNode）。
+
+示意（以向量索引相关）：
+
+```python
+# IndexDict: text_id 映射
+class IndexDict(TypedDict):
+    # nodes_dict: node_id -> vector_store_text_id
+    nodes_dict: dict[str, str]
+```
+
+---
+
+## 核心算法（Core Algorithm）
+
+- VectorStoreIndex（llama_index.core.indices.vector_store.base）
+  - 思路：批量计算 embedding → 写入向量库 → 维护 `IndexDict` 与 `docstore` 一致性；
+  - 伪代码：
+    ```python
+    def _add_nodes_to_index(index_struct, nodes):
+        for batch in iter_batch(nodes, B):
+            embeds = embed(batch)
+            ids = vector_store.add(assign_embedding(batch, embeds))
+            if not stores_text:
+                for node, tid in zip(batch, ids):
+                    index_struct.add_node(node_wo_embedding(node), text_id=tid)
+                    docstore.add(node_wo_embedding(node))
+    ```
+  - 复杂度：O(N/B 次调用 + N)；存储取决于是否重复存文本。
+  - 边界：空内容 Node 跳过；`ref_doc_info` 仅在不存文本时可用。
+
+- SummaryIndex（ListIndex）
+  - 思路：顺序累积 Node；检索时线性遍历/筛选；
+  - 复杂度：构建 O(N)，检索与策略有关（默认线性）。
+
+- TreeIndex
+  - 思路：自底向上聚合，父节点为子节点摘要；插入通过 `TreeIndexInserter` 局部重构；
+  - 复杂度：构建约 O(N) 次合成；深度 ~ log_k(N)（k 为 `num_children`）。
+
+- KeywordTableIndex
+  - 思路：对每个 Node 抽取关键词（LLM/RAKE），建立关键词到 Node 的映射；
+  - 复杂度：构建 O(N·K)（K 为平均关键词数）；检索基于关键词匹配。
+
+- DocumentSummaryIndex
+  - 思路：按文档聚合 Node → 合成文档摘要 TextNode → 可选嵌入入向量库；
+  - 复杂度：O(#docs) 次合成 + O(#docs) 嵌入；
+  - 边界：`embed_summaries=False` 时仅支持基于 LLM 的检索器模式。
+
+- PropertyGraphIndex
+  - 思路：对 Node 运行路径/三元组抽取 transformations → 在属性图存储 upsert 节点与关系；可选对 KG 节点向量化并落入向量库（当图存储不支持向量查询时）；
+  - 去重：按 KG 节点 id 与 LlamaIndex Node hash 过滤；
+  - 复杂度：受抽取/嵌入/存储 upsert 影响，近似 O(N)；
+  - 边界：核心状态在图存储，`IndexLPG` 作为占位结构。
+
+---
+
+## 设计权衡与替代方案（Trade-offs）
+
+- 文本存储：向量库存文本 vs 只存向量
+  - 存文本：减少 DocStore 写放大；但 `ref_doc_info`/去重能力受限；
+  - 不存文本：需写 DocStore 与 IndexStruct；但可精准控制删除/刷新。
+- LLM 依赖程度
+  - 关键词/摘要/树 依赖 LLM，质量高但成本高；可提供简化策略（RAKE/embedding-only）。
+- 插入/更新策略
+  - `insert_nodes` 增量写更快；`refresh_ref_docs` 基于 hash 精准更新，减少重复嵌入。
+- 跨后端可移植性
+  - 通过 `StorageContext` 解耦，但不同后端能力（是否存文本、是否支持向量/结构化查询）需在索引层分支处理。
+
+---
+
+## 集成点（Integration Points）
+
+- 生命周期：
+  - 构建：`from_documents` → transformations → `build_index_from_nodes`；
+  - 增量：`insert(_nodes)`/`delete_nodes`/`delete_ref_doc`/`refresh_ref_docs`；
+- 检索接口：`as_retriever(**kwargs)` 输出与索引耦合的检索器（如 `VectorIndexRetriever`、`SummaryIndexRetriever` 等）。
+- 元数据过滤：检索时可传入 `filters=MetadataFilters` 进行先过滤后相似搜索；示例见站点：
+  - `/python/framework/getting_started/metadata_filters_e2e`（基础用法）
+  - `/python/framework/getting_started/metadata_filters_operators`（本地操作符演示）
+  - `/python/framework/getting_started/metadata_filters_qdrant_pinecone`（Qdrant/Pinecone 集成）
+- 查询/对话：`as_query_engine()` 包装 `RetrieverQueryEngine`；`as_chat_engine()` 间接复用检索结果。
+- 存储协作：`StorageContext` 统一 `docstore/index_store/vector_store/graph_store`；索引只维护必要结构与一致性。
+
+---
+
+## 公共接口与语义（Public API & Semantics）
+
+- 构建
+  - `VectorStoreIndex.from_documents(docs, storage_context=..., embed_model=...)`
+  - `VectorStoreIndex.from_vector_store(vector_store, ...)`（要求后端 `stores_text=True`）
+  - `PropertyGraphIndex(nodes=..., property_graph_store=..., vector_store=...)`
+- 变更
+  - `insert(document)` / `insert_nodes(nodes)`；
+  - `delete_nodes(node_ids, delete_from_docstore=...)`；
+  - `delete_ref_doc(ref_doc_id, delete_from_docstore=...)`；
+  - `refresh_ref_docs(updated_documents)`；
+- 语义要点
+  - 所有 Node 在被索引后，应可通过检索器在相同 `StorageContext` 下取回；
+  - 删除/刷新需保证 `index_store`、向量库/图存储与 `docstore` 的一致性；
+  - 不同索引的 Retriever 模式定义其检索“语义”（embedding/LLM/hybrid/树遍历等）。
+
+用法最小示例（向量索引）：
+
+```python
+from llama_index.core import Settings
+from llama_index.core.indices.vector_store import VectorStoreIndex
+from llama_index.core.schema import Document
+
+# 1) 构建索引（从文档）
+Settings.embed_model = ...  # 配置你的 embedding 模型
+index = VectorStoreIndex.from_documents([
+    Document(text="A quick brown fox"),
+    Document(text="jumps over the lazy dog"),
+])
+
+# 2) 获取检索器与查询引擎
+retriever = index.as_retriever(similarity_top_k=3)
+qe = index.as_query_engine()
+
+# 3) 检索/查询
+nodes = retriever.retrieve("fox")
+resp = qe.query("What jumps over the lazy dog?")
+print(resp)
+```
+
+说明：
+- 构建时批量嵌入入库；若向量库不存文本，Index 同步写入 `docstore`/`IndexDict`；
+- 检索器返回 `NodeWithScore[]`；查询引擎在此基础上进行合成；
+- `similarity_top_k` 等参数在检索层生效，不影响索引结构。
+
+---
+
+## 详细示例（VectorStoreIndex：数据模型 & 核心算法）
+
+本节用高细节阐述 VectorStoreIndex 的内部数据模型与算法流程，满足 how-to 模板中“必须详述”的要求。
+
+### 数据模型
+
+- 字段定义（核心）
+  - `IndexDict.nodes_dict: dict[node_id -> text_id]`
+    - 含义：当向量库不存文本（`stores_text=False`）或 `store_nodes_override=True` 时，记录 Node 与向量库条目的关联 ID（text_id）。
+    - 取值：`node_id`/`text_id` 均为字符串，唯一标识。
+  - `DocStore`：持久化 Node 本体（去除 embedding 以避免重复存储）。
+  - `VectorStore`：持久化嵌入后的 Node（或其文本表示）及返回的条目 ID（`text_id`）。
+  - `StorageContext.index_store`：保存 `IndexDict` 结构（含 index_id、summary 等元信息）。
+
+- 标识与引用语义
+  - `node_id`：Node 的主键；由 Node 创建时生成，跨存储一致。
+  - `text_id`：向量库条目 ID；由向量库返回；一对一对应于一次 `add()` 的结果项。
+  - `ref_doc_id`：引用原始 Document 的 ID；用于删除/刷新整篇文档相关的节点。
+
+- 关系模型
+
+```mermaid
+erDiagram
+  NODE ||--o{ VECTOR_ENTRY : mapped_by
+  NODE {
+    string node_id PK
+    string ref_doc_id
+    string metadata
+    string content
+  }
+  VECTOR_ENTRY {
+    string text_id PK
+    string embedding
+  }
+  INDEX_DICT {
+    string nodes_dict
+  }
+```
+
+- 不变式
+  - 若 `stores_text=False` 或 `store_nodes_override=True`：
+    - `IndexDict.nodes_dict` 的所有 key 必须能在 DocStore 中找到对应 Node；
+    - 任一 `node_id` 在 `nodes_dict` 中至多映射一个 `text_id`；
+  - 若 `stores_text=True` 且未 override：DocStore 仅存 Image/IndexNode 等必要节点，文本 Node 由向量库持有；
+  - `node.embedding` 不应在 DocStore 中重复存储（入库前需置空）。
+
+- 状态与迁移（构建/插入/删除/刷新）
+
+```mermaid
+flowchart LR
+  A[Nodes 准备] --> B[批量嵌入]
+  B --> C[VectorStore.add / async_add]
+  C --> D{stores_text?}
+  D -- 否 或 强制覆盖 --> E[写 DocStore + IndexDict]
+  D -- 是 且无需覆盖 --> F[仅 Image/IndexNode 写 DocStore + IndexDict]
+```
+
+- 存储映射与去重
+  - `stores_text=False`：DocStore 保存 Node（去 embedding），IndexDict 记录映射；
+  - `stores_text=True`：默认只为非文本节点维护 DocStore/IndexDict；
+  - 去重：构建阶段会跳过“无内容”的节点；其他去重依赖上层摄取/刷新策略。
+
+- 变更语义
+  - `insert_nodes(nodes)`：按“构建”流程增量写入，更新 DocStore/IndexDict；
+  - `delete_nodes(node_ids, delete_from_docstore)`：先删向量库，再按需删 DocStore 与 IndexDict；
+  - `delete_ref_doc(ref_doc_id, ...)`：基于 DocStore 的 `RefDocInfo` 删除成组节点；
+  - `refresh_ref_docs(docs)`：基于 hash 比较，仅对变更文档执行更新，避免重复嵌入。
+
+- 示例数据（stores_text=False 情形下）
+
+```json
+{
+  "index_struct": {
+    "nodes_dict": {
+      "N:1": "T:101",
+      "N:2": "T:102"
+    }
+  },
+  "docstore": {
+    "N:1": {"text": "A quick brown fox", "metadata": {"lang": "en"}},
+    "N:2": {"text": "jumps over the lazy dog", "metadata": {}}
+  }
+}
+```
+
+### 核心算法
+
+- 详细步骤（构建）
+  1) 过滤空内容节点；
+  2) 批处理嵌入（`embed_nodes` / `async_embed_nodes`）并写入向量库（`add/async_add`）；
+  3) 若需在本地持有文本：清空 `embedding`，写入 DocStore，并在 `IndexDict` 记录 `node_id -> text_id`；
+  4) 最终将 `IndexDict` 写入 `index_store`。
+
+- 带注释伪代码
+
+```python
+def _add_nodes_to_index(index_struct, nodes, stores_text, store_nodes_override, B=2048):
+    for batch in iter_batch(nodes, B):                      # 批量以减少模型/IO 调用
+        embeds = embed_nodes(batch)                         # 批量嵌入
+        batch_with_embed = assign_embedding(batch, embeds)  # 附加嵌入
+        text_ids = vector_store.add(batch_with_embed)       # 入库，返回 text_id 列表
+
+        need_local_text = (not stores_text) or store_nodes_override
+        for node, tid in zip(batch_with_embed, text_ids):
+            node_wo = node.model_copy(); node_wo.embedding = None  # 避免重复存 embedding
+            if need_local_text or is_non_text_node(node):          # Image/IndexNode 仍需挂接
+                index_struct.add_node(node_wo, text_id=tid)        # 维护映射
+                docstore.add(node_wo, allow_update=True)
+```
+
+- ::: info
+  失败与回退
+  - 空内容节点：直接跳过并告警；
+  - 嵌入失败：重试/标记失败节点跳过入库；
+  - 向量库入库失败：整体回滚该批 DocStore/IndexDict 写入；
+  - 标识不一致：`text_id` 缺失或重复需拒绝提交，并修复映射后重试。
+  :::
+
+- 并发模型
+  - `use_async=True` 路径下，`async_add/async_embed` 与批处理并发执行；
+  - DocStore 写入在批内顺序进行，避免竞态；必要时可通过节点粒度的幂等写入保障重试安全。
+
+- 正确性要点
+  - 不变量（见上）：确保 `IndexDict` 与 DocStore/VectorStore 的一一对应关系；
+  - 重建性：在 `stores_text=False` 下，可仅凭 DocStore + IndexDict 重建索引视图。
+
+---
+
+### 用法示例（向量索引 VectorStoreIndex）
+
+```python
+from llama_index.core import Settings
+from llama_index.core.indices.vector_store import VectorStoreIndex
+from llama_index.core.schema import Document
+
+# 1) 构建索引（从文档）
+Settings.embed_model = ...  # 配置你的 embedding 模型
+index = VectorStoreIndex.from_documents([
+    Document(text="A quick brown fox"),
+    Document(text="jumps over the lazy dog"),
+])
+
+# 2) 获取检索器与查询引擎
+retriever = index.as_retriever(similarity_top_k=3)
+qe = index.as_query_engine()
+
+# 3) 检索/查询
+nodes = retriever.retrieve("fox")
+resp = qe.query("What jumps over the lazy dog?")
+print(resp)
+```
+
+讲解：
+- 构建时批量嵌入入库；若向量库不存文本，Index 同步写入 `docstore`/`IndexDict`；
+- 检索器返回 `NodeWithScore[]`；查询引擎在此基础上进行合成；
+- `similarity_top_k` 等参数在检索层生效，不影响索引结构。
+
+---
+
+## 详细示例（TreeIndex：数据模型 & 核心算法）
+
+本节针对 TreeIndex 的 IndexGraph 与构建、检索算法做深入说明。
+
+### 数据模型
+
+- IndexStruct：`IndexGraph`
+  - `all_nodes: dict[int, str]` 用连续整数索引映射到 `node_id`；
+  - `root_nodes: dict[int, str]` 根层的索引到 `node_id`；
+  - `node_id_to_children_ids: dict[str, list[str]]` 记录父子关系（只存子链表）。
+- DocStore：持久化所有节点文本，包含由父节点汇总生成的摘要节点。
+- Invariants（不变式）
+  - 插入后，图中每个 LabelledNode.id 唯一；
+  - 重复 Node 按 id 去重，重复 LlamaIndex Node 按 `hash` 过滤；
+  - 若进行向量化，向量条目的文本为 LabelledNode 的 `str(node)`，且 Node.embedding 置空避免双存。
+- 存储映射
+  - 图节点与关系写入 `property_graph_store`；
+  - 需要向量检索时，将图节点投影为 `TextNode` 写入向量库（可外接）。
+
+流程示意：
+
+```mermaid
+flowchart TD
+  N[Nodes] --> T[KG extractors]
+  T --> P[Add source props]
+  P --> D[Deduplicate]
+  D --> E[Embed nodes optional]
+  E --> U[Upsert nodes and relations]
+  U --> V[Vector index optional]
+```
+
+### 核心算法
+
+- 插入 `_insert_nodes`
+  1) 运行 `kg_extractors`，从 Node.metadata 读取 `KG_NODES/RELATIONS`；
+  2) 为每个图节点与关系写入 `triplet_source_id` 属性；
+  3) 过滤重复图节点（按 id）与重复 LlamaIndex 节点（按 hash）；
+  4) 若开启向量化，对 Llama 节点文本与图节点字符串分别批量嵌入；
+  5) 若使用外部向量库，投影图节点为 `TextNode` 写入向量库；
+  6) 先 upsert Llama 节点，再 upsert 图节点，最后 upsert 关系；必要时刷新图 schema。
+
+伪代码：
+
+```python
+def build_index_from_nodes(graph, cur_ids):
+    if len(cur_ids) <= k:
+        graph.root_nodes = cur_ids
+        return graph
+    chunks = group(cur_ids, k)
+    summaries = [llm(summary_prompt, texts(chunk)) for chunk in chunks]
+    new_ids = construct_parent_nodes(graph, chunks, summaries)  # 写 DocStore
+    return build_index_from_nodes(graph, new_ids)
+```
+
+- 检索（TreeSelectLeafRetriever）
+  1) 从 `root_nodes` 开始，取出当前层候选节点文本；
+  2) 通过提示词让 LLM 选择子节点编号（或多编号，取决于 `child_branch_factor`）；
+  3) 递归向下，直至叶子，返回叶子 `Node` 集合；
+  4) 作为 `NodeWithScore[]` 输出，或在 `query()` 路径下由合成器进行回答与 refine。
+
+  复杂度与参数：
+- 构建 LLM 次数约为每层分组数之和，层数约为 `O(log_k N)`；
+- `num_children` 越大，层数越浅但每次摘要更长；
+- 检索每层 1 次或若干次 LLM 选择调用，总体与树高线性相关；
+- `child_branch_factor` 增大可提高召回但增加代价。
+
+失败与回退：
+- 编号提取失败时，代码会退化为拼接当前层文本直接作答；
+- 构建失败时建议整体回滚该层写入，保持三表一致性。
+
+正确性要点：
+- 由构建器保证父子有向无环与索引一致；
+- 检索只读结构，不改变不变量。
+
+---
+
+### 用法示例（属性图索引 PropertyGraphIndex）
+
+```python
+from llama_index.core import Settings
+from llama_index.core.indices.property_graph import PropertyGraphIndex
+from llama_index.core.schema import Document
+
+# 1) 构建属性图索引（提取三元组/路径后写入图存储）
+Settings.llm = ...  # 用于路径/三元组抽取
+index = PropertyGraphIndex.from_documents(
+    [Document(text="Alice works at Acme in Seattle."),
+     Document(text="Bob works with Alice.")],
+    embed_kg_nodes=True,   # 对图节点做向量化（便于相似搜索）
+)
+
+# 2) 检索（默认子检索组合：LLM 同义词 + 向量上下文）
+retriever = index.as_retriever(include_text=True)
+nodes = retriever.retrieve("Alice 的同事在哪工作？")
+
+# 可选：自定义图/向量后端
+# from llama_index.core.storage.storage_context import StorageContext
+# from llama_index.core.graph_stores.simple_labelled import SimplePropertyGraphStore
+# from llama_index.core.vector_stores.simple import SimpleVectorStore
+# sc = StorageContext.from_defaults(
+#     property_graph_store=SimplePropertyGraphStore(),
+# )
+# index = PropertyGraphIndex.from_documents(docs, storage_context=sc, embed_kg_nodes=False)
+```
+
+讲解：
+- 抽取：默认 `kg_extractors=[SimpleLLMPathExtractor, ImplicitPathExtractor]`，在插入前对 Node 运行转换，生成 `KG_NODES/RELATIONS`；
+- 写入：将节点与关系 upsert 到属性图存储；若 `embed_kg_nodes=True` 且需向量检索，则将图节点投影为 `TextNode` 入向量库；
+- 检索：`as_retriever()` 组合多个子检索器（同义词/向量）并聚合结果；
+- 边界：核心状态保存在图存储；`ref_doc_info` 未实现；如后端不支持向量检索可外接向量库。
+
+---
+
+## 详细示例（PropertyGraphIndex：数据模型 & 核心算法）
+
+本节深入说明属性图索引的数据对象与插入流程。
+
+### 数据模型
+
+- IndexStruct：`IndexLPG`（占位，不持久保存图结构）
+- PropertyGraphStore（核心状态）
+  - 节点：`LabelledNode` 抽象，常见为 `EntityNode(name)` 与 `ChunkNode(text, id_)`；
+  - 关系：`Relation(label, source_id, target_id, properties)`；
+  - 三元组：以 `(subj_id, rel_id, obj_id)` 形式去重保存。
+- 元信息键
+  - `KG_NODES_KEY`、`KG_RELATIONS_KEY`：由抽取器写入 Node.metadata，表示待上图的节点与关系；
+  - `TRIPLET_SOURCE_KEY`：插入前写入每个节点与关系的 properties，指向原始 LlamaIndex Node.id；
+  - `VECTOR_SOURCE_KEY`：当需向量检索时，向量节点的 metadata 中标注来源。
+- Invariants（不变式）
+  - 插入后，图中每个 LabelledNode.id 唯一；
+  - 重复 Node 按 id 去重，重复 LlamaIndex Node 按 `hash` 过滤；
+  - 若进行向量化，向量条目的文本为 LabelledNode 的 `str(node)`，且 Node.embedding 置空避免双存。
+- 存储映射
+  - 图节点与关系写入 `property_graph_store`；
+  - 需要向量检索时，将图节点投影为 `TextNode` 写入向量库（可外接）。
+
+流程示意：
+
+```mermaid
+flowchart TD
+  N[Nodes] --> T[KG extractors]
+  T --> P[Add source props]
+  P --> D[Deduplicate]
+  D --> E[Embed nodes optional]
+  E --> U[Upsert nodes and relations]
+  U --> V[Vector index optional]
+```
+
+### 核心算法
+
+- 插入 `_insert_nodes`
+  1) 运行 `kg_extractors`，从 Node.metadata 读取 `KG_NODES/RELATIONS`；
+  2) 为每个图节点与关系写入 `triplet_source_id` 属性；
+  3) 过滤重复图节点（按 id）与重复 LlamaIndex 节点（按 hash）；
+  4) 若开启向量化，对 Llama 节点文本与图节点字符串分别批量嵌入；
+  5) 若使用外部向量库，投影图节点为 `TextNode` 写入向量库；
+  6) 先 upsert Llama 节点，再 upsert 图节点，最后 upsert 关系；必要时刷新图 schema。
+
+伪代码：
+
+```python
+def _insert_nodes(nodes):
+    nodes = run_transformations(nodes, kg_extractors)
+    kg_nodes, kg_rels = pop_from_metadata(nodes)
+    tag_source(kg_nodes, kg_rels, key=TRIPLET_SOURCE_KEY)
+    kg_nodes = dedup_by_id(kg_nodes)
+    nodes = dedup_by_hash(nodes)
+    if embed_kg_nodes:
+        nodes = embed_llama_nodes(nodes)
+        kg_nodes = embed_labelled_nodes(kg_nodes)
+    if vector_store and kg_nodes:
+        insert_vector_index(kg_nodes)  # as TextNode
+    if nodes:
+        property_graph_store.upsert_llama_nodes(nodes)
+    if kg_nodes:
+        property_graph_store.upsert_nodes(kg_nodes)
+    if kg_rels:
+        property_graph_store.upsert_relations(kg_rels)
+```
+
+  复杂度与参数：
+  - 抽取成本取决于 `kg_extractors`（LLM 版成本较高）；
+  - 向量化成本与节点数线性相关；
+  - `embed_kg_nodes` 控制是否对图节点向量化；
+  - 若后端支持向量/结构化查询，可省略外接向量库或直接使用 `structured_query`。
+
+失败与回退：
+  - 任一步骤失败应避免部分写入导致的数据漂移（先准备好批数据，再原子写入）；
+  - 对于重复或无效的节点/关系应跳过并记录。
+
+正确性要点：
+  - `TRIPLET_SOURCE_KEY` 保证从图节点反查回原始 Llama 节点；
+  - 去重策略与 schema 刷新确保图结构一致与可查询性。
+
+
+### 用法示例（KeywordTableIndex：数据模型 & 核心算法）
+
+```python
+from llama_index.core import Settings
+from llama_index.core.indices.keyword_table import KeywordTableIndex
+from llama_index.core.schema import Document
+
+# 1) 构建关键词索引（从文档）
+Settings.llm = ...  # 用于关键词抽取
+index = KeywordTableIndex.from_documents([
+    Document(text="A quick brown fox"),
+    Document(text="jumps over the lazy dog"),
+])
+
+# 2) 检索（基于关键词匹配）
+retriever = index.as_retriever()
+nodes = retriever.retrieve("fox")
+
+# 可选：自定义关键词抽取器
+# from llama_index.core.indices.keyword_table.base import KeywordExtractor
+# extractor = KeywordExtractor(llm=Settings.llm, max_keywords=10)
+# index = KeywordTableIndex.from_documents(docs, extractor=extractor)
+```
+
+讲解：
+- 抽取：默认 `keyword_extractor=SimpleLLMKeywordExtractor`，在插入前对 Node 运行转换，生成关键词集合；
+- 写入：将关键词与 Node ID 的映射写入 `keyword_table`；
+- 检索：`as_retriever()` 基于关键词匹配返回 Node 集合；
+- 边界：核心状态保存在 `keyword_table`；`ref_doc_info` 未实现。
+
+---
+
+## 详细示例（KeywordTableIndex：数据模型 & 核心算法）
+
+本节深入说明关键词索引的数据对象与插入流程。
+
+### 数据模型
+
+- IndexStruct：`KeywordTable`
+  - `table: dict[keyword -> set[node_id]]` 关键词到节点集合的倒排表；
+- DocStore：存放节点文本与元数据；
+- Invariants（不变式）
+  - `table` 中每个 `node_id` 必须可在 DocStore 找到；
+  - 当某关键词对应集合变空，应当从 `table` 中删除该关键词；
+  - 关键词应规范化（大小写/全半角/空白折叠）保持一致性；
+- 状态与迁移
+  - 构建/插入：对每个节点抽取关键词集合并加入倒排表；
+  - 删除节点：从所有包含该 `node_id` 的集合中移除，若为空则删关键词条目；
+  - 刷新：需按更新后的文本重新抽取关键词（LLM 模式成本较高）。
+
+关系示意：
+
+```mermaid
+erDiagram
+  KEYWORD ||--o{ NODE : maps
+  KEYWORD {
+    string term PK
+  }
+  NODE {
+    string node_id PK
+    string content
+  }
+```
+
+### 核心算法
+
+- 关键词抽取
+  - LLM 模式：用 `DEFAULT_KEYWORD_EXTRACT_TEMPLATE` 生成，随后解析；
+  - RAKE/简单模式：基于统计或规则生成；
+  - 复杂度：每节点 O(K)（K 为关键词数）；LLM 模式额外引入模型推理成本；
+
+- 构建/插入伪代码
+
+```python
+def add_nodes(index_struct, nodes):
+    for n in nodes:
+        text = n.get_content(metadata_mode=LLM)
+        kws = extract_keywords(text, max_k)
+        index_struct.add_node(list(kws), n)  # 更新倒排表
+        docstore.add_documents([n], allow_update=True)
+```
+
+- 检索（概述）
+  - 简单/RAKE：对查询抽取关键词，取并/交集得到候选节点；
+  - LLM：可用 LLM 进行语义扩展（同义/改写）后再匹配；
+
+- 参数与影响
+  - `max_keywords_per_chunk`：过小召回低、过大噪声高；
+  - 模式选择：LLM 精度高但成本高，RAKE 快但易漏召；
+
+- 失败与回退
+  - 解析失败或关键词为空时，回退到简单分词/规则；
+  - 关键词规范化失败会导致重复条目，应统一管道；
+
+- 正确性要点
+  - 关键词表属于“词袋”检索，易受同义词影响；可结合向量检索或同义扩展增强召回。
+
+---
+
+## 详细示例（DocumentSummaryIndex：数据模型 & 核心算法）
+
+本节说明文档摘要索引的映射关系与构建/检索流程。
+
+### 数据模型
+
+- IndexStruct：`IndexDocumentSummary`
+  - `summary_id_to_node_ids: dict[summary_id -> list[node_id]]`
+  - `node_id_to_summary_id: dict[node_id -> summary_id]`
+  - `doc_id_to_summary_id: dict[doc_id -> summary_id]`
+- DocStore：存放原始节点与“摘要节点”（`TextNode`）。
+- VectorStore（可选）：当 `embed_summaries=True` 时，存放摘要节点的嵌入；
+- Invariants（不变式）
+  - 三张映射表保持互相可推导；不存在悬挂的 node/summary 关联；
+  - 摘要节点的 `ref_doc_id` 必须存在且与 `doc_id_to_summary_id` 一致；
+
+关系示意：
+
+```mermaid
+erDiagram
+  DOC ||--|| SUMMARY : has
+  SUMMARY ||--o{ NODE : summarizes
+  DOC {
+    string doc_id PK
+  }
+  SUMMARY {
+    string summary_id PK
+  }
+  NODE {
+    string node_id PK
+  }
+```
+
+### 核心算法
+
+- 构建
+  1) 按 `ref_doc_id` 将节点分组；
+  2) 对每组节点调用 `response_synthesizer.synthesize(summary_query, nodes)` 生成文档级摘要文本；
+  3) 创建摘要 `TextNode`，写入 DocStore，并调用 `index_struct.add_summary_and_nodes(summary, nodes)` 完成三表映射；
+  4) 若 `embed_summaries=True`，对摘要节点批量嵌入并写入 VectorStore。
+
+- 伪代码
+
+```python
+for doc_id, nodes in group_by_ref_doc_id(nodes):
+    summary_txt = synthesize(summary_query, nodes)
+    s_node = TextNode(text=summary_txt, ref_doc_id=doc_id)
+    docstore.add_documents([s_node])
+    index_struct.add_summary_and_nodes(s_node, nodes)
+    if embed:
+        vs.add(assign_embedding([s_node]))
+```
+
+- 检索（两种模式）
+  - Embedding 模式：在向量库中召回摘要节点，再映射回该文档的节点集；
+  - LLM 模式：对摘要进行 LLM 评分/选择，或直接基于摘要作答。
+
+- 参数与影响
+  - `summary_query`、`response_synthesizer`：影响摘要质量与长度；
+  - `embed_summaries`：是否允许向量化快速召回；
+
+- 变更/删除
+  - `delete_nodes(node_ids)`：更新 `summary_id_to_node_ids` 并清理空摘要；
+  - `delete_ref_doc(doc_id)`：移除三表映射与向量条目；
+
+- 失败与回退
+  - 缺失 `ref_doc_id`：抛错并跳过；
+  - 摘要合成失败：可回退到简单拼接或跳过该文档；
+
+- 正确性要点
+  - 三表映射维持“文档↔摘要↔节点”的可逆关系；
+  - 嵌入摘要不会改变节点文本，仅用于召回。
+
+---
+
+## 与相关特性的关系（Relationships）
+
+- 上游（摄取）：`NodeParser/Transformations` 决定 Node 的粒度与元数据，直接影响召回与合成质量。
+- 同级（检索）：索引自带的 Retriever 定义“如何取”；可与其他 Retriever 融合（如 Query Fusion）。
+- 下游（查询/合成/对话）：QueryEngine/ResponseSynthesizer/ChatEngine 在检索结果之上工作；索引不直接生成答案。
+
+```mermaid
+flowchart LR
+  Ingest[摄取: Document->Node] --> Index[本索引]
+  Index -- as_retriever --> R[Retriever]
+  R --> QE[QueryEngine]
+  QE --> Synth[Response Synthesizer]
+```
+
+要点：索引的职责是“组织与一致性”；“如何回答”由上层定义。
+
+---
+
+## 限制与边界条件（Limitations）
+
+::: info
+  - `VectorStoreIndex.ref_doc_info`：当后端 `stores_text=True` 时不支持；
+  - `TreeIndex`：不支持节点级删除；
+  - `DocumentSummaryIndex`：关闭 `embed_summaries` 时仅支持 LLM 检索模式；
+  - `KnowledgeGraphIndex`：已废弃，推荐使用 `PropertyGraphIndex`；
+  - `PropertyGraphIndex`：`ref_doc_info` 未实现，核心状态在图存储。
+:::
+
+---
+
+## 关键决策与未决问题
+
+- 是否在向量库存文本（影响删除/刷新能力与存储成本）
+- LLM 依赖型索引的默认开关与回退策略（RAKE/embedding-only）
+- 属性图与向量检索的融合接口是否进一步统一
+
+---
+
+## 变更记录
+
+- YYYY-MM-DD — 初始版本 — <负责人>
