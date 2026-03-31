@@ -47,7 +47,7 @@ def suffix_to_language(suffix: str) -> str:
 
 
 class TerminalConfirmation:
-    def __init__(self, console: Console | None = None):
+    def __init__(self, console: Console | None = None) -> None:
         self.console = console or Console()
 
     async def confirm_write(self, file_path: str, new_content: str, *, show_diff: bool = True) -> bool:

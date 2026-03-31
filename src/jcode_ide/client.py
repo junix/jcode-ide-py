@@ -95,7 +95,7 @@ class IDEClient:
     其他只读操作（get_open_files、get_selection 等）不受此锁限制。
     """
 
-    def __init__(self, server_info: ServerInfo):
+    def __init__(self, server_info: ServerInfo) -> None:
         self.server_info = server_info
         self._diff_lock = asyncio.Lock()
         self._client: httpx.AsyncClient | None = None
@@ -108,7 +108,7 @@ class IDEClient:
         )
         return self
 
-    async def __aexit__(self, *args: Any) -> None:
+    async def __aexit__(self, *args: type[BaseException] | None) -> None:
         if self._client:
             logger.debug("Closing IDE client connection")
             await self._client.aclose()
