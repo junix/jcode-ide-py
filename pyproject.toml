@@ -19,6 +19,13 @@ packages = ["src/jcode_ide"]
 [tool.pytest.ini_options]
 testpaths = ["src/jcode_ide/tests"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ALL"]
+"**/tests/**" = ["ALL"]
+"**/test_*.py" = ["ALL"]
+"e2e/**" = ["ALL"]
+"**/e2e/**" = ["ALL"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
