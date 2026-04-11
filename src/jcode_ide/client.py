@@ -182,7 +182,7 @@ class IDEClient:
 
     async def _call_tool(self, name: str, arguments: dict[str, Any], *, timeout: float = 30.0) -> dict[str, Any]:
         client = self._get_client()
-        should_close = self._client is None
+        is_temporary_client = self._client is None
 
         try:
             logger.debug("Calling IDE MCP tool", bind={"tool": name, "timeout": timeout, "args": list(arguments.keys())})
@@ -218,5 +218,5 @@ class IDEClient:
             logger.error("IDE HTTP request failed", bind={"tool": name, "error": str(exc)})
             raise IDEConnectionError(f"HTTP error: {exc}") from exc
         finally:
-            if should_close:
+            if is_temporary_client:
                 await client.aclose()
