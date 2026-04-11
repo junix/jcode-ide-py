@@ -18,16 +18,24 @@ class _LoggerProxy:
             return f"{message} | {bind}"
         return message
 
-    def debug(self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False) -> None:
+    def debug(
+        self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False
+    ) -> None:
         self._logger.debug(self._render(message, args, bind), exc_info=exc_info)
 
-    def info(self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False) -> None:
+    def info(
+        self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False
+    ) -> None:
         self._logger.info(self._render(message, args, bind), exc_info=exc_info)
 
-    def warning(self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False) -> None:
+    def warning(
+        self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False
+    ) -> None:
         self._logger.warning(self._render(message, args, bind), exc_info=exc_info)
 
-    def error(self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False) -> None:
+    def error(
+        self, message: str, *args: object, bind: dict[str, object] | None = None, exc_info: BaseException | bool | None = False
+    ) -> None:
         self._logger.error(self._render(message, args, bind), exc_info=exc_info)
 
 

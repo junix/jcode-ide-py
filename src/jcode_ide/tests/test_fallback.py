@@ -25,8 +25,7 @@ def test_diff_result_helpers_reflect_status() -> None:
 def test_parse_port_file(tmp_path: Path) -> None:
     port_file = tmp_path / "letta-ide-server-test-8123.json"
     port_file.write_text(
-        '{"port":8123,"authToken":"token","workspacePath":"/tmp/ws","pid":123,"createdAt":456,"instanceNonce":"abc"}',
-        encoding="utf-8",
+        '{"port":8123,"authToken":"token","workspacePath":"/tmp/ws","pid":123,"createdAt":456,"instanceNonce":"abc"}', encoding="utf-8"
     )
 
     server = IDEServerDiscovery._parse_port_file(port_file)

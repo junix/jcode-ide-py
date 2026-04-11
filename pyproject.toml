@@ -19,6 +19,12 @@ packages = ["src/jcode_ide"]
 [tool.pytest.ini_options]
 testpaths = ["src/jcode_ide/tests"]
 
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ALL"]
 "**/tests/**" = ["ALL"]

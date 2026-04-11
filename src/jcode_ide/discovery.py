@@ -52,11 +52,7 @@ class IDEServerDiscovery:
     PORT_FILE_DIR: ClassVar[Path] = Path.home() / ".tmp" / "letta" / "ide"
 
     @classmethod
-    async def find_server(
-        cls,
-        workspace_path: str | None = None,
-        verify_ping: bool = True,
-    ) -> ServerInfo | None:
+    async def find_server(cls, workspace_path: str | None = None, verify_ping: bool = True) -> ServerInfo | None:
         if port_str := os.environ.get("LETTA_IDE_SERVER_PORT"):
             try:
                 server = cls._load_server_by_port(int(port_str))
@@ -133,12 +129,7 @@ class IDEServerDiscovery:
                 response = await client.post(
                     f"{server.base_url}/mcp",
                     headers={"Authorization": f"Bearer {server.auth_token}"},
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "tools/call",
-                        "params": {"name": ToolNames.PING, "arguments": {}},
-                        "id": 1,
-                    },
+                    json={"jsonrpc": "2.0", "method": "tools/call", "params": {"name": ToolNames.PING, "arguments": {}}, "id": 1},
                 )
                 result = response.json()
                 nonce = result.get("result", {}).get("nonce")

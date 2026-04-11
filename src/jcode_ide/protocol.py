@@ -20,7 +20,11 @@ class ToolNames:
 DiffStatus = Literal["accepted", "rejected", "error"]
 
 MCP_TOOLS = [
-    {"name": ToolNames.PING, "description": "Health check and identity verification", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+    {
+        "name": ToolNames.PING,
+        "description": "Health check and identity verification",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
     {
         "name": ToolNames.OPEN_DIFF,
         "description": "Open a diff view for a file in the IDE and block until the user accepts or rejects it.",
@@ -42,9 +46,21 @@ MCP_TOOLS = [
             "required": ["filePath"],
         },
     },
-    {"name": ToolNames.GET_OPEN_FILES, "description": "Return the list of files currently open in the IDE", "inputSchema": {"type": "object", "properties": {}, "required": []}},
-    {"name": ToolNames.GET_ACTIVE_EDITOR, "description": "Return the active editor info, including cursor position", "inputSchema": {"type": "object", "properties": {}, "required": []}},
-    {"name": ToolNames.GET_SELECTION, "description": "Return the current editor selection (subject to privacy settings)", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+    {
+        "name": ToolNames.GET_OPEN_FILES,
+        "description": "Return the list of files currently open in the IDE",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": ToolNames.GET_ACTIVE_EDITOR,
+        "description": "Return the active editor info, including cursor position",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": ToolNames.GET_SELECTION,
+        "description": "Return the current editor selection (subject to privacy settings)",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 DEFAULT_DIFF_TIMEOUT_MS = 300_000

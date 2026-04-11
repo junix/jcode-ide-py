@@ -103,8 +103,7 @@ class IDEClient:
     async def __aenter__(self) -> IDEClient:
         logger.debug("Opening IDE client connection", bind={"server_url": self.server_info.base_url})
         self._client = httpx.AsyncClient(
-            base_url=self.server_info.base_url,
-            headers={"Authorization": f"Bearer {self.server_info.auth_token}"},
+            base_url=self.server_info.base_url, headers={"Authorization": f"Bearer {self.server_info.auth_token}"}
         )
         return self
 
@@ -117,10 +116,7 @@ class IDEClient:
     def _get_client(self) -> httpx.AsyncClient:
         if self._client:
             return self._client
-        return httpx.AsyncClient(
-            base_url=self.server_info.base_url,
-            headers={"Authorization": f"Bearer {self.server_info.auth_token}"},
-        )
+        return httpx.AsyncClient(base_url=self.server_info.base_url, headers={"Authorization": f"Bearer {self.server_info.auth_token}"})
 
     async def ping(self) -> dict[str, Any]:
         return await self._call_tool(ToolNames.PING, {}, timeout=DEFAULT_TOOL_TIMEOUT_MS / 1000)
@@ -131,21 +127,10 @@ class IDEClient:
 
         async with self._diff_lock:
             try:
-                logger.debug(
-                    "Opening IDE diff view",
-                    bind={"file_path": file_path, "timeout": timeout, "content_length": len(new_content)},
-                )
-                response = await self._call_tool(
-                    ToolNames.OPEN_DIFF,
-                    {"filePath": file_path, "newContent": new_content},
-                    timeout=timeout,
-                )
+                logger.debug("Opening IDE diff view", bind={"file_path": file_path, "timeout": timeout, "content_length": len(new_content)})
+                response = await self._call_tool(ToolNames.OPEN_DIFF, {"filePath": file_path, "newContent": new_content}, timeout=timeout)
                 logger.debug("Received IDE diff result", bind={"status": response.get("status", "error")})
-                return DiffResult(
-                    status=response.get("status", "error"),
-                    content=response.get("content"),
-                    error=response.get("error"),
-                )
+                return DiffResult(status=response.get("status", "error"), content=response.get("content"), error=response.get("error"))
             except IDEError as exc:
                 logger.error("IDE diff operation failed", bind={"file_path": file_path, "error": str(exc)})
                 return DiffResult(status="error", error=str(exc))
