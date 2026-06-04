@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ruff format .
+ruff check --fix .
+
+if ! git diff --quiet; then
+  echo "ruff format/check changed files. Please review, git add, and commit again."
+  exit 1
+fi
