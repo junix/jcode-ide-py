@@ -77,6 +77,16 @@ class SelectionInfo:
     content_sharing_disabled: bool = False
 
 
+def _position_from_dict(data: dict[str, Any] | None) -> Position:
+    data = data or {}
+    return Position(line=data.get("line", 0), character=data.get("character", 0))
+
+
+def _range_from_dict(data: dict[str, Any] | None) -> Range:
+    data = data or {}
+    return Range(start=_position_from_dict(data.get("start")), end=_position_from_dict(data.get("end")))
+
+
 class IDEClient:
     """IDE MCP 客户端——通过 HTTP JSON-RPC 调用 IDE 扩展的 MCP 工具。
 
@@ -157,11 +167,8 @@ class IDEClient:
         return ActiveEditorInfo(
             file_path=response["filePath"],
             language_id=response.get("languageId", ""),
-            cursor_position=Position(line=cursor.get("line", 0), character=cursor.get("character", 0)),
-            visible_range=Range(
-                start=Position(line=visible.get("start", {}).get("line", 0), character=visible.get("start", {}).get("character", 0)),
-                end=Position(line=visible.get("end", {}).get("line", 0), character=visible.get("end", {}).get("character", 0)),
-            ),
+            cursor_position=_position_from_dict(cursor),
+            visible_range=_range_from_dict(visible),
         )
 
     async def get_selection(self) -> SelectionInfo | None:
@@ -172,10 +179,7 @@ class IDEClient:
         range_data = response.get("range", {})
         return SelectionInfo(
             file_path=response["filePath"],
-            range=Range(
-                start=Position(line=range_data.get("start", {}).get("line", 0), character=range_data.get("start", {}).get("character", 0)),
-                end=Position(line=range_data.get("end", {}).get("line", 0), character=range_data.get("end", {}).get("character", 0)),
-            ),
+            range=_range_from_dict(range_data),
             text=response.get("text"),
             content_sharing_disabled=response.get("contentSharingDisabled", False),
         )
